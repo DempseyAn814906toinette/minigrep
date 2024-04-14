@@ -218,3 +218,254 @@ impl Config {
     }
 }
 ```
+
+## 错误处理
+
+回顾一下，如果用户不输入任何命令行参数，我们的程序会怎么样？
+
+```sh
+$ cargo run
+   Compiling minigrep v0.1.0 (file:///projects/minigrep)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.0s
+     Running `target/debug/minigrep`
+thread 'main' panicked at 'index out of bounds: the len is 1 but the index is 1', src/main.rs:27:21
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+结果喜闻乐见，由于 args 数组没有任何元素，因此通过索引访问时，会直接报出数组访问越界的 `panic`。
+
+报错信息对于开发者会很明确，但是对于使用者而言，就相当难理解了，下面一起来解决它。
+
+### 改进报错信息
+
+还记得在错误处理章节，我们提到过 `panic` 的两种用法: `被动触发`和`主动调用`嘛？上面代码的出现方式很明显是被动触发，这种报错信息是不可控的，下面我们先改成主动调用的方式:
+
+```rust
+// in main.rs
+ // --snip--
+    fn new(args: &[String]) -> Config {
+        if args.len() < 3 {
+            panic!("not enough arguments");
+        }
+        // --snip--
+```
+
+目的很明确，一旦传入的参数数组长度小于 3，则报错并让程序崩溃推出，这样后续的数组访问就不会再越界了。
+
+```sh
+$ cargo run
+   Compiling minigrep v0.1.0 (file:///projects/minigrep)
+    Finished dev [unoptimized + debuginfo] target(s) in 0.0s
+     Running `target/debug/minigrep`
+thread 'main' panicked at 'not enough arguments', src/main.rs:26:13
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+不错，用户看到了更为明确的提示，但是还是有一大堆 debug 输出，这些我们其实是不想让用户看到的。这么看来，想要输出对用户友好的信息, panic 是不太适合的，它更适合告知开发者，哪里出现了问题。
+
+### 返回 Result 来替代直接 panic
+
+那只能祭出之前学过的错误处理大法了，也就是返回一个 Result：成功时包含 Config 实例，失败时包含一条错误信息。
+
+有一点需要额外注意下，从代码惯例的角度出发，`new` 往往不会失败，毕竟新建一个实例没道理失败，对不？因此修改为 `build` 会更加合适。
+
+```rust
+impl Config {
+    fn build(args: &[String]) -> Result<Config, &'static str> {
+        if args.len() < 3 {
+            return Err("not enough arguments");
+        }
+
+        let query = args[1].clone();
+        let file_path = args[2].clone();
+
+        Ok(Config { query, file_path })
+    }
+}
+```
+
+### 处理返回的 Result
+
+接下来就是在调用 build 函数时，对返回的 Result 进行处理了，目的就是给出准确且友好的报错提示, 为了让大家更好的回顾我们修改过的内容，这里给出整体代码:
+
+```rust
+use std::env;
+use std::fs;
+use std::process;
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    // 对 build 返回的 `Result` 进行处理
+    let config = Config::build(&args).unwrap_or_else(|err| {
+        println!("Problem parsing arguments: {err}");
+        process::exit(1);
+    });
+
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    let contents = fs::read_to_string(config.file_path)
+        .expect("Should have been able to read the file");
+
+    println!("With text:\n{contents}");
+}
+
+struct Config {
+    query: String,
+    file_path: String,
+}
+
+impl Config {
+    fn build(args: &[String]) -> Result<Config, &'static str> {
+        if args.len() < 3 {
+            return Err("not enough arguments");
+        }
+
+        let query = args[1].clone();
+        let file_path = args[2].clone();
+
+        Ok(Config { query, file_path })
+    }
+}
+```
+
+上面代码有几点值得注意:
+
+- 当 Result 包含错误时，我们不再调用 `panic` 让程序崩溃，而是通过 `process::exit(1)` 来终结进程，其中 `1` 是一个信号值(事实上非 0 值都可以)，通知调用我们程序的进程，程序是因为错误而退出的。
+
+- `unwrap_or_else` 是定义在 `Result<T,E>` 上的常用方法，如果 Result 是 Ok，那该方法就类似 unwrap：返回 Ok 内部的值；如果是 Err，就调用闭包中的自定义代码对错误进行进一步处理
+
+综上可知，`config` 变量的值是一个 `Config` 实例，而 `unwrap_or_else` 闭包中的 `err`参数，它的类型是 `'static str`，值是 `"not enough arguments"` 那个字符串字面量。
+
+终于，我们得到了自己想要的输出：既告知了用户为何报错，又消除了多余的 debug 信息，非常棒。可能有用户疑惑，`cargo run` 底下还有一大堆 `debug` 信息呢，实际上，这是 `cargo run` 自带的，大家可以试试编译成二进制可执行文件后再调用，会是什么效果。
+
+## 分离主体逻辑
+
+接下来可以继续精简 main 函数，那就是将主体逻辑( 例如业务逻辑 )从 main 中分离出去，这样 main 函数就保留主流程调用，非常简洁。
+
+```rust
+// in main.rs
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    let config = Config::build(&args).unwrap_or_else(|err| {
+        println!("Problem parsing arguments: {err}");
+        process::exit(1);
+    });
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    run(config);
+}
+
+fn run(config: Config) {
+    let contents = fs::read_to_string(config.file_path)
+        .expect("Should have been able to read the file");
+
+    println!("With text:\n{contents}");
+}
+
+// --snip--
+```
+
+如上所示，main 函数仅保留主流程各个环节的调用，一眼看过去非常简洁清晰。
+
+### 使用 ? 和特征对象来返回错误
+
+`run` 函数没有错误处理，因为在文章开头我们提到过，错误处理最好统一在一个地方完成，这样极其有利于后续的代码维护。
+
+```rust
+//in main.rs
+use std::error::Error;
+
+// --snip--
+
+fn run(config: Config) -> Result<(), Box<dyn Error>> {
+    let contents = fs::read_to_string(config.file_path)?;
+
+    println!("With text:\n{contents}");
+
+    Ok(())
+}
+```
+
+值得注意的是这里的 `Result<(), Box<dyn Error>>` 返回类型，首先我们的程序无需返回任何值，但是为了满足 `Result<T,E>` 的要求，因此使用了 `Ok(())` 返回一个单元类型 `()`。
+
+最重要的是 `Box<dyn Error>`， 如果按照顺序学到这里，大家应该知道这是一个 `Error` 的特征对象(为了使用 Error，我们通过 `use std::error::Error;` 进行了引入)，它表示函数返回一个类型，该类型实现了 Error 特征，这样我们就无需指定具体的错误类型，否则你还需要查看 fs::read_to_string 返回的错误类型，然后复制到我们的 run 函数返回中，这么做一个是麻烦，最主要的是，一旦这么做，意味着我们无法在上层调用时统一处理错误，但是`Box<dyn Error>` 不同，其它函数也可以返回这个特征对象，然后调用者就可以使用统一的方式来处理不同函数返回的 `Box<dyn Error>`。
+
+### 处理返回的错误
+
+```rust
+fn main() {
+    // --snip--
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    if let Err(e) = run(config) {
+        println!("Application error: {e}");
+        process::exit(1);
+    }
+}
+```
+
+没错 `if let` 的使用让代码变得更简洁，可读性也更加好，原因是，我们并不关注 `run` 返回的 Ok 值，因此只需要用 `if let` 去匹配是否存在错误即可。
+
+好了，截止目前，代码看起来越来越美好了，距离我们的目标也只差一个：将主体逻辑代码分离到一个独立的文件 `lib.rs` 中。
+
+## 分离逻辑代码到库包中
+
+首先，创建一个 src/lib.rs 文件，然后将所有的非 main 函数都移动到其中。
+
+```rust
+use std::error::Error;
+use std::fs;
+
+pub struct Config {
+    pub query: String,
+    pub file_path: String,
+}
+
+impl Config {
+    pub fn build(args: &[String]) -> Result<Config, &'static str> {
+        // --snip--
+    }
+}
+
+pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+    // --snip--
+}
+```
+
+为了内容的简洁性，这里忽略了具体的实现，下一步就是在 main.rs 中引入 lib.rs 中定义的 Config 类型。
+
+```rust
+use std::env;
+use std::process;
+
+use minigrep::Config;
+
+fn main() {
+    // --snip--
+    let args: Vec<String> = env::args().collect();
+
+    let config = Config::build(&args).unwrap_or_else(|err| {
+        println!("Problem parsing arguments: {err}");
+        process::exit(1);
+    });
+
+    println!("Searching for {}", config.query);
+    println!("In file {}", config.file_path);
+
+    if let Err(e) = minigrep::run(config) {
+        // --snip--
+        println!("Application error: {e}");
+        process::exit(1);
+    }
+}
+```
+
+很明显，这里的 `mingrep::run` 的调用，以及 `Config` 的引入，跟使用其它第三方包已经没有任何区别，也意味着我们成功的将逻辑代码放置到一个独立的库包中，其它包只要引入和调用就行。
